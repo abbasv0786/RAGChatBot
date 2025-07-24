@@ -17,6 +17,7 @@ import time
 import re
 from urllib.parse import urlparse, parse_qs
 import pinecone
+from pinecone import Pinecone, ServerlessSpec
 
 # Apply nest_asyncio to handle nested event loops
 nest_asyncio.apply()
@@ -42,8 +43,6 @@ st.set_page_config(
 # Initialize Pinecone
 if PINECONE_API_KEY:
     try:
-        from pinecone import Pinecone, ServerlessSpec
-        
         pc = Pinecone(api_key=PINECONE_API_KEY)
         
         # Create index if it doesn't exist
@@ -367,16 +366,89 @@ def clear_pinecone_database():
             return False
             
         index_name = "ai-research-assistant"
-        from pinecone import Pinecone
         
         pc = Pinecone(api_key=PINECONE_API_KEY)
         
-        if index_name in pc.list_indexes().names():
-            index = pc.Index(index_name)
-            # Delete all vectors from the index
-            index.delete(delete_all=True)
+        # Check if index exists
+        existing_indexes = pc.list_indexes().names()
+        
+        if index_name not in existing_indexes:
+            # Index doesn't exist, create it
+            st.info("Creating new Pinecone index...")
+            pc.create_index(
+                name=index_name,
+                dimension=768,  # Dimension for Google's embedding model
+                metric="cosine",
+                spec=ServerlessSpec(
+                    cloud="aws",
+                    region="us-east-1"
+                )
+            )
+            # Wait for index to be ready
+            time.sleep(10)  # Give the index time to initialize
+            st.success("New index created successfully!")
             return True
-        return True
+        else:
+            # Index exists, try to clear it
+            index = pc.Index(index_name)
+            
+            # First, check if index has any vectors
+            try:
+                stats = index.describe_index_stats()
+                total_vectors = stats.get('total_vector_count', 0)
+                
+                if total_vectors == 0:
+                    st.info("Database is already empty.")
+                    return True
+                
+                # Try to delete all vectors
+                try:
+                    index.delete(delete_all=True)
+                    st.success(f"Successfully cleared {total_vectors} vectors from database.")
+                    return True
+                except Exception as delete_error:
+                    # If delete fails due to namespace issues, try recreating the index
+                    st.warning(f"Delete failed, recreating index: {str(delete_error)}")
+                    
+                    # Delete and recreate the index
+                    pc.delete_index(index_name)
+                    time.sleep(5)  # Wait for deletion
+                    
+                    pc.create_index(
+                        name=index_name,
+                        dimension=768,
+                        metric="cosine",
+                        spec=ServerlessSpec(
+                            cloud="aws",
+                            region="us-east-1"
+                        )
+                    )
+                    time.sleep(10)  # Wait for creation
+                    st.success("Index recreated successfully!")
+                    return True
+                    
+            except Exception as stats_error:
+                st.warning(f"Could not get index stats, proceeding with recreation: {str(stats_error)}")
+                # If we can't even get stats, recreate the index
+                try:
+                    pc.delete_index(index_name)
+                    time.sleep(5)
+                    pc.create_index(
+                        name=index_name,
+                        dimension=768,
+                        metric="cosine",
+                        spec=ServerlessSpec(
+                            cloud="aws",
+                            region="us-east-1"
+                        )
+                    )
+                    time.sleep(10)
+                    st.success("Index recreated successfully!")
+                    return True
+                except Exception as recreate_error:
+                    st.error(f"Failed to recreate index: {str(recreate_error)}")
+                    return False
+        
     except Exception as e:
         st.error(f"Error clearing database: {str(e)}")
         return False
@@ -392,8 +464,6 @@ def create_vectorstore(chunks):
         index_name = "ai-research-assistant"
         
         # Get or create the index using new API
-        from pinecone import Pinecone, ServerlessSpec
-        
         pc = Pinecone(api_key=PINECONE_API_KEY)
         
         if index_name not in pc.list_indexes().names():
