@@ -4,8 +4,9 @@ langchain
 langchain-openai
 langchain-google-genai
 langchain-community
+langchain-pinecone
 youtube_transcript_api
-faiss-cpu
+pinecone
 openai
 tiktoken
 beautifulsoup4

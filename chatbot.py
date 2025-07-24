@@ -1,6 +1,6 @@
 import streamlit as st
 from PyPDF2 import PdfReader
-from langchain_community.vectorstores import FAISS
+from langchain_pinecone import PineconeVectorStore
 from langchain_community.llms import Together
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -16,6 +16,7 @@ import os
 import time
 import re
 from urllib.parse import urlparse, parse_qs
+import pinecone
 
 # Apply nest_asyncio to handle nested event loops
 nest_asyncio.apply()
@@ -27,6 +28,8 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "gcp-starter")
 
 # Page configuration
 st.set_page_config(
@@ -35,6 +38,28 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+# Initialize Pinecone
+if PINECONE_API_KEY:
+    try:
+        from pinecone import Pinecone, ServerlessSpec
+        
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        # Create index if it doesn't exist
+        index_name = "ai-research-assistant"
+        if index_name not in pc.list_indexes().names():
+            pc.create_index(
+                name=index_name,
+                dimension=768,  # Dimension for Google's embedding model
+                metric="cosine",
+                spec=ServerlessSpec(
+                    cloud="aws",
+                    region="us-east-1"
+                )
+            )
+    except Exception as e:
+        st.error(f"Error initializing Pinecone: {str(e)}")
 
 # Clean Light Theme CSS
 st.markdown("""
@@ -290,8 +315,8 @@ def get_youtube_transcript(url):
             st.error("Invalid YouTube URL")
             return None
             
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        text = ' '.join([entry['text'] for entry in transcript])
+        transcript = YouTubeTranscriptApi().fetch(video_id=video_id)
+        text = ' '.join([entry.text for entry in transcript])
         return text
     except Exception as e:
         st.error(f"Error getting YouTube transcript: {str(e)}")
@@ -334,11 +359,60 @@ def get_document_chunks(text):
         st.error(f"Error splitting text: {str(e)}")
         return None
 
-def create_vectorstore(chunks):
-    """Create FAISS vectorstore for all content types"""
+def clear_pinecone_database():
+    """Clear all vectors from the Pinecone database"""
     try:
+        if not PINECONE_API_KEY:
+            st.error("Pinecone API key not found. Please set PINECONE_API_KEY in your .env file.")
+            return False
+            
+        index_name = "ai-research-assistant"
+        from pinecone import Pinecone
+        
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        if index_name in pc.list_indexes().names():
+            index = pc.Index(index_name)
+            # Delete all vectors from the index
+            index.delete(delete_all=True)
+            return True
+        return True
+    except Exception as e:
+        st.error(f"Error clearing database: {str(e)}")
+        return False
+
+def create_vectorstore(chunks):
+    """Create Pinecone vectorstore for all content types"""
+    try:
+        if not PINECONE_API_KEY:
+            st.error("Pinecone API key not found. Please set PINECONE_API_KEY in your .env file.")
+            return None
+            
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vectorstore = FAISS.from_texts(chunks, embeddings)
+        index_name = "ai-research-assistant"
+        
+        # Get or create the index using new API
+        from pinecone import Pinecone, ServerlessSpec
+        
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        if index_name not in pc.list_indexes().names():
+            pc.create_index(
+                name=index_name,
+                dimension=768,  # Dimension for Google's embedding model
+                metric="cosine",
+                spec=ServerlessSpec(
+                    cloud="aws",
+                    region="us-east-1"
+                )
+            )
+        
+        # Create Pinecone vectorstore
+        vectorstore = PineconeVectorStore.from_texts(
+            texts=chunks,
+            embedding=embeddings,
+            index_name=index_name
+        )
         return vectorstore
     except Exception as e:
         st.error(f"Error creating vectorstore: {str(e)}")
@@ -350,6 +424,13 @@ def process_content(content, source_type, source_identifier):
     status_text = st.empty()
     
     try:
+        status_text.text(f"Clearing previous database...")
+        progress_bar.progress(10)
+        
+        # Clear the database first
+        if not clear_pinecone_database():
+            return False
+            
         status_text.text(f"Processing {source_type}...")
         progress_bar.progress(20)
         
@@ -379,6 +460,9 @@ def process_content(content, source_type, source_identifier):
         status_text.text("Processing complete!")
         st.session_state.processComplete = True
         st.session_state.source_type = source_type
+        
+        # Clear chat history when new content is processed
+        st.session_state.chat_history = []
         
         time.sleep(1)
         progress_bar.empty()
@@ -537,12 +621,23 @@ def render_chat():
         </div>
         """, unsafe_allow_html=True)
     else:
-        st.markdown(f"""
-        <div class="card">
-            <div class="card-header">💬 Chat with {st.session_state.source_type}</div>
-            <p>Ask questions about your content and get intelligent responses</p>
-        </div>
-        """, unsafe_allow_html=True)
+        # Chat header with clear button
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.markdown(f"""
+            <div class="card">
+                <div class="card-header">💬 Chat with {st.session_state.source_type}</div>
+                <p>Ask questions about your content and get intelligent responses</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            if st.button("🗑️ Clear Chat", type="secondary", use_container_width=True):
+                if st.session_state.chat_history:
+                    st.session_state.chat_history = []
+                    st.success("Chat history cleared!")
+                    st.rerun()
+                else:
+                    st.info("Chat history is already empty.")
         
         # Display chat history
         for role, message in st.session_state.chat_history:
